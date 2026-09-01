@@ -2,10 +2,10 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type PcComponentManifestMemberSchema = {
-    id: number;
+export type PcLocalMediaCandidateSchema = {
+    component_id: number;
+    member_id: number;
     relative_path: string;
-    size_bytes: number;
-    sha256: string;
+    source_sha256: string;
+    image_type: string;
 };
-
