@@ -2,10 +2,11 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type PcMetadataSelectionRequest = {
-    candidate_id: string;
-    query: string;
-    selected_media_ids?: Array<string>;
+export type PcComponentNoteCreateRequest = {
+    title: string;
+    content?: string;
+    is_public?: boolean;
+    tags?: (Array<string> | null);
     expected_version: string;
 };
 

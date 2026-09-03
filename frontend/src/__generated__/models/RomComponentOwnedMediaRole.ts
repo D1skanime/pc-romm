@@ -2,9 +2,4 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type PcMetadataMediaSchema = {
-    id: string;
-    kind: string;
-    url: string;
-};
-
+export type RomComponentOwnedMediaRole = 'cover' | 'background' | 'gallery' | 'screenshot' | 'artwork' | 'soundtrack' | 'video';
