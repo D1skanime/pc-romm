@@ -1,0 +1,565 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import subprocess
+from pathlib import Path
+from types import ModuleType
+from typing import Protocol
+
+import pytest
+
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+HARNESS_PATH = BACKEND_ROOT / "tools" / "verify_phase6_acceptance.py"
+
+EXPECTED_PRIOR_MODULES = (
+    "tests/alembic/test_mapping_preview_migration.py",
+    "tests/endpoints/roms/test_files.py",
+    "tests/endpoints/roms/test_rom.py",
+    "tests/endpoints/storage/test_mapping_preview.py",
+    "tests/endpoints/test_storage.py",
+    "tests/endpoints/test_storage_policy_denials.py",
+    "tests/handler/database/test_storage_handler.py",
+    "tests/handler/filesystem/test_external_read_consumers.py",
+    "tests/handler/filesystem/test_owned_storage.py",
+    "tests/handler/filesystem/test_storage_access.py",
+    "tests/handler/filesystem/test_storage_inventory.py",
+    "tests/handler/filesystem/test_storage_policy.py",
+    "tests/handler/filesystem/test_storage_resolver.py",
+    "tests/handler/filesystem/test_sync_handler.py",
+    "tests/handler/storage/test_preview.py",
+    "tests/handler/test_scan_command.py",
+    "tests/integration/test_mapped_scan.py",
+    "tests/integration/test_scan_source_immutability.py",
+    "tests/models/test_storage.py",
+    "tests/tasks/test_mapping_revision_jobs.py",
+    "tests/tasks/test_storage_policy.py",
+    "tests/test_sync_watcher.py",
+    "tests/test_watcher.py",
+    "tests/tools/test_verify_storage_migrations.py",
+    "tests/utils/test_archives.py",
+    "tests/utils/test_audio_tags.py",
+    "tests/utils/test_gamelist_exporter.py",
+    "tests/utils/test_pegasus_exporter.py",
+    "tests/utils/test_zip_cache.py",
+)
+
+EXPECTED_ROUND4_TEST_IDS = (
+    "pytest::tests/integration/test_legacy_migration.py::test_folder_rom_parent_reconnects_from_exact_observed_children",
+    "pytest::tests/endpoints/roms/test_manual.py::test_uploaded_token_manual_survives_restart_and_deletes_exactly",
+    "pytest::tests/handler/filesystem/test_resources_handler.py::test_validated_token_manual_path_is_authoritative_after_restart",
+    "pytest::tests/endpoints/roms/test_manual.py::test_missing_owned_token_manual_clears_exact_authoritative_reference",
+    "pytest::tests/endpoints/roms/test_manual.py::test_primary_manual_cas_failure_preserves_prior_path_and_cleans_candidate",
+    "pytest::tests/endpoints/roms/test_manual.py::test_upload_first_redownload_race_has_one_winner_and_no_orphan",
+    "pytest::tests/endpoints/roms/test_manual.py::test_redownload_first_upload_race_has_one_winner_and_no_orphan",
+    "pytest::tests/endpoints/roms/test_manual.py::test_local_uri_redownload_uses_staged_cas_and_preserves_source[file]",
+    "pytest::tests/endpoints/roms/test_manual.py::test_local_uri_redownload_uses_staged_cas_and_preserves_source[launchbox-file]",
+    "pytest::tests/endpoints/test_screenshots.py::test_hidden_rom_screenshot_update_is_masked_before_effects",
+    "pytest::tests/endpoints/test_screenshots.py::test_hidden_platform_screenshot_update_is_masked_before_effects",
+    "pytest::tests/endpoints/test_screenshots.py::test_hidden_rom_screenshot_delete_is_masked_before_effects",
+    "pytest::tests/endpoints/test_screenshots.py::test_hidden_platform_screenshot_delete_is_masked_before_effects",
+    "pytest::tests/handler/filesystem/test_storage_access.py::test_owned_create_close_error_never_closes_reused_descriptor[binary_file]",
+    "pytest::tests/handler/filesystem/test_storage_access.py::test_owned_create_close_error_never_closes_reused_descriptor[subprocess_file]",
+    "vitest::src/v2/components/GameDetails/ManualSubtab.test.ts::ManualSubtab > redownload_blocks_every_competing_manual_gesture",
+    "vitest::src/v2/components/GameDetails/ManualViewerControls.test.ts::ManualViewerControls > pdf_controls_stay_visible_and_disabled_while_pending",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > mobile-320 > mouse",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > mobile-320 > touch",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > mobile-320 > keyboard",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > mobile-320 > gamepad",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > desktop > mouse",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > desktop > touch",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > desktop > keyboard",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > light > desktop > gamepad",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > mobile-320 > mouse",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > mobile-320 > touch",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > mobile-320 > keyboard",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > mobile-320 > gamepad",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > desktop > mouse",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > desktop > touch",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > desktop > keyboard",
+    "playwright::chromium::e2e/manual-mutation-pending.spec.ts::manual mutation pending matrix > dark > desktop > gamepad",
+)
+
+EXPECTED_PHASE6_MODULES = (
+    "tests/endpoints/roms/test_catalog_removal.py",
+    "tests/endpoints/roms/test_files.py",
+    "tests/endpoints/roms/test_manual.py",
+    "tests/endpoints/sockets/test_scan.py",
+    "tests/endpoints/test_saves.py",
+    "tests/endpoints/test_screenshots.py",
+    "tests/endpoints/test_states.py",
+    "tests/endpoints/test_storage.py",
+    "tests/endpoints/test_storage_policy_denials.py",
+    "tests/handler/database/test_storage_lifecycle.py",
+    "tests/handler/filesystem/test_storage_access.py",
+    "tests/handler/filesystem/test_resources_handler.py",
+    "tests/handler/filesystem/test_storage_inventory.py",
+    "tests/handler/storage/test_legacy_migration.py",
+    "tests/handler/storage/test_read_context.py",
+    "tests/integration/test_legacy_migration.py",
+    "tests/models/test_safe_lifecycle.py",
+    "tests/tasks/test_detect_legacy_storage.py",
+    "tests/tools/test_verify_phase6_contracts.py",
+    "tests/tools/test_verify_storage_migrations.py",
+    "tests/utils/test_rom_patcher.py",
+)
+
+CURRENT_UNTRACKED_BASELINE = (
+    "?? .codex/",
+    "?? .planning/STATE.md.orig",
+    "?? .planning/codebase/",
+    "?? .planning/debug/",
+    "?? .planning/phases/04-v2-storage-design-specification/04-01-PLAN.md",
+    "?? .planning/phases/04-v2-storage-design-specification/04-02-PLAN.md",
+    "?? .planning/phases/04-v2-storage-design-specification/04-03-PLAN.md",
+    "?? .planning/phases/04-v2-storage-design-specification/04-CONTEXT.md",
+    "?? .planning/phases/04-v2-storage-design-specification/04-DISCUSSION-LOG.md",
+    "?? .planning/phases/04-v2-storage-design-specification/04-PATTERNS.md",
+    "?? .planning/phases/04-v2-storage-design-specification/04-RESEARCH.md",
+    "?? .planning/phases/04-v2-storage-design-specification/04-SOURCE-AUDIT.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-01-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-02-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-03-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-04-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-05-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-06-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-07-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-08-PLAN.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-CONTEXT.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-DISCUSSION-LOG.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-PATTERNS.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-RESEARCH.md",
+    "?? .planning/phases/05-preview-and-read-path-cutover/05-SOURCE-AUDIT.md",
+    "?? .planning/phases/11-local-pc-media-and-dlc-navigation/.gitkeep",
+    "?? .planning/phases/12-dlc-detail-pages-for-local-pc-components/.gitkeep",
+    "?? .planning/todos/pending/2026-08-04-enforce-external-library-read-only.md",
+    "?? .tmp/",
+    "?? docs/PC_GAME_COMPONENTS_AND_MANIFEST_DOWNLOADS_ANALYSIS.md",
+    "?? docs/superpowers/plans/",
+    "?? frontend/src/services/api/storage.test.ts",
+    "?? frontend/src/v2/views/Storage/PlatformStorageMapping.test.ts",
+)
+CURRENT_UNTRACKED_BASELINE_SHA256 = (
+    "c32bbaa280c654f223f92f43a6f5abcb5f969afcc9c1df79696b2255f6d38215"
+)
+
+
+class Resource(Protocol):
+    database: str
+
+
+def load_verifier() -> ModuleType:
+    assert HARNESS_PATH.exists(), "acceptance harness is not implemented"
+    spec = importlib.util.spec_from_file_location(
+        "verify_phase6_acceptance", HARNESS_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def valid_record(verifier: ModuleType) -> dict[str, object]:
+    prior = [
+        {"module": module, "passed": 33, "failed": 0, "errors": 0, "exit_code": 0}
+        for module in verifier.PRIOR_PHASE_MODULES
+    ]
+    prior[0]["passed"] = 843 - 33 * (len(prior) - 1)
+    phase6 = [
+        {"module": module, "passed": 1, "failed": 0, "errors": 0, "exit_code": 0}
+        for module in verifier.deduplicated_phase6_modules()
+    ]
+    record: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": "a" * 32,
+        "command_identity": verifier.CANONICAL_COMMAND_IDENTITY,
+        "checkout": {
+            "root": "/home/d1sk/romm",
+            "branch": "codex/pc-module-analysis",
+            "origin": "https://github.com/rommapp/romm.git",
+            "project": "RomM PC Library",
+        },
+        "stages": {
+            "db_continuity": {"before": 1, "after": 1, "exit_code": 0},
+            "prior_backend": {"modules": prior, "outcomes": 843, "exit_code": 0},
+            "phase6_backend": {"modules": phase6, "exit_code": 0},
+            "dialects": {
+                name: {"exit_code": 0, "authority": "complete"}
+                for name in ("mariadb", "mysql", "postgresql")
+            },
+            "contracts": {
+                "exit_code": 0,
+                "generated_before": "b" * 64,
+                "generated_after": "b" * 64,
+            },
+            "frontend": {
+                name: {"exit_code": 0}
+                for name in (
+                    "focused",
+                    "full",
+                    "typecheck",
+                    "build",
+                    "locales",
+                    "static",
+                )
+            },
+            "manifests": {"before": "c" * 64, "after": "c" * 64, "equal": True},
+            "cleanup": {
+                "containers": 0,
+                "databases": 0,
+                "principals": 0,
+                "basetemps": 0,
+                "volumes": 0,
+                "exit_code": 0,
+            },
+            "baseline": {
+                "untracked_count": verifier.APPROVED_UNTRACKED_BASELINE_COUNT,
+                "untracked_sha256": verifier.BASELINE_UNTRACKED_SHA256,
+            },
+            "git": {"diff_check": 0},
+            "manual_ui": {
+                "status": "previously_validated_no_drift",
+                "evidence": "06-45-SUMMARY.md",
+            },
+        },
+    }
+    record["run_digest"] = verifier.canonical_run_digest(record)
+    return record
+
+
+def source_audit_text(verifier: ModuleType) -> str:
+    rows = [
+        "| Source | ID | Required item | Coverage | Status |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    rows.extend(
+        f"| CURRENT | {source_id} | Current contract | 47 | COVERED |"
+        for source_id in sorted(verifier.REQUIRED_SOURCE_IDS)
+    )
+    return "\n".join(rows)
+
+
+def validation_text(record: dict[str, object]) -> str:
+    return (
+        "# Phase 6 Validation\n\n"
+        f"Run ID: `{record['run_id']}`\n\n"
+        f"Run Digest: `{record['run_digest']}`\n\n"
+        "Prior modules: 29\n\nPrior outcomes: 843\n"
+    )
+
+
+def test_harness_pins_29_prior_modules_and_isolates_each() -> None:
+    verifier = load_verifier()
+    assert verifier.PRIOR_PHASE_MODULES == EXPECTED_PRIOR_MODULES
+    assert len(verifier.PRIOR_PHASE_MODULES) == 29
+    assert len(set(verifier.PRIOR_PHASE_MODULES)) == 29
+    assert all((BACKEND_ROOT / path).is_file() for path in verifier.PRIOR_PHASE_MODULES)
+    assert verifier.PRIOR_OUTCOMES_MIN == 843
+
+    identities = [
+        verifier.ResourceIdentity.create(index)
+        for index in range(len(EXPECTED_PRIOR_MODULES))
+    ]
+    assert len({identity.database for identity in identities}) == 29
+    assert len({identity.principal for identity in identities}) == 29
+    assert len({identity.basetemp for identity in identities}) == 29
+    assert len({identity.container for identity in identities}) == 29
+    for module, identity in zip(EXPECTED_PRIOR_MODULES, identities, strict=True):
+        command = verifier.backend_module_command(
+            Path("/home/d1sk/romm"),
+            module,
+            identity,
+            "romm-romm-dev",
+            "romm_default",
+        )
+        rendered = " ".join(command)
+        assert identity.database in rendered
+        assert identity.principal in rendered
+        assert identity.basetemp in rendered
+        assert identity.container in rendered
+        assert "ROMM_BASE_PATH=romm_test" in command
+        assert "-p no:env" in rendered
+        assert "-p no:cacheprovider" in rendered
+        assert "--network none" not in rendered
+        assert "--network romm_default" in rendered
+        assert "--entrypoint /bin/sh" in rendered
+        assert "--publish" not in command
+        assert "mkdir -p /app/backend/romm_test/library" in rendered
+
+
+def test_phase6_inventory_is_exact_deduplicated_and_unfiltered() -> None:
+    verifier = load_verifier()
+    assert verifier.PHASE6_MODULES == EXPECTED_PHASE6_MODULES
+    expected = tuple(
+        path for path in EXPECTED_PHASE6_MODULES if path not in EXPECTED_PRIOR_MODULES
+    )
+    assert verifier.deduplicated_phase6_modules() == expected
+    assert all((BACKEND_ROOT / path).is_file() for path in EXPECTED_PHASE6_MODULES)
+    for index, module in enumerate(expected):
+        command = verifier.backend_module_command(
+            Path("/home/d1sk/romm"),
+            module,
+            verifier.ResourceIdentity.create(index),
+            "romm-romm-dev",
+            "romm_default",
+        )
+        assert "-k" not in command
+
+
+def test_untracked_baseline_accepts_only_the_approved_current_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = load_verifier()
+
+    def status_output(lines: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, "\n".join(lines) + "\n", "")
+
+    monkeypatch.setattr(
+        verifier,
+        "_run",
+        lambda _args, **_kwargs: status_output(CURRENT_UNTRACKED_BASELINE),
+    )
+
+    assert verifier._baseline_record(Path("/unused"), 33) == {
+        "untracked_count": 33,
+        "untracked_sha256": CURRENT_UNTRACKED_BASELINE_SHA256,
+    }
+
+    monkeypatch.setattr(
+        verifier,
+        "_run",
+        lambda _args, **_kwargs: status_output(CURRENT_UNTRACKED_BASELINE[:-1]),
+    )
+    with pytest.raises(verifier.StageFailure, match="untracked baseline"):
+        verifier._baseline_record(Path("/unused"), 33)
+
+
+def test_module_lifecycle_cleans_exact_resources_after_failure() -> None:
+    verifier = load_verifier()
+    calls: list[tuple[str, str]] = []
+    identity = verifier.ResourceIdentity.create(3)
+
+    def create(resource: Resource) -> None:
+        calls.append(("create", resource.database))
+
+    def execute(_command: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(("execute", identity.container))
+        return subprocess.CompletedProcess([], 7, "1 failed", "")
+
+    def cleanup(resource: Resource) -> None:
+        calls.append(("cleanup", resource.database))
+
+    with pytest.raises(verifier.StageFailure, match="backend module"):
+        verifier.execute_backend_module(
+            "tests/example.py",
+            identity,
+            ["pytest", "tests/example.py"],
+            create_resources=create,
+            execute_command=execute,
+            cleanup_resources=cleanup,
+        )
+    assert calls == [
+        ("create", identity.database),
+        ("execute", identity.container),
+        ("cleanup", identity.database),
+    ]
+
+
+def test_required_round4_test_ids_reject_omission_rename_and_same_module_substitution() -> (
+    None
+):
+    verifier = load_verifier()
+    assert verifier.REQUIRED_ROUND4_TEST_IDS == EXPECTED_ROUND4_TEST_IDS
+    assert len(verifier.REQUIRED_ROUND4_TEST_IDS) == 33
+    assert len(set(verifier.REQUIRED_ROUND4_TEST_IDS)) == 33
+    results = [
+        {"id": identifier, "outcome": "passed"}
+        for identifier in EXPECTED_ROUND4_TEST_IDS
+    ]
+    verifier.validate_round4_results(results)
+    mutations = (
+        results[:-1],
+        [
+            {**results[0], "id": results[0]["id"].replace("children", "child")},
+            *results[1:],
+        ],
+        [
+            {
+                **results[0],
+                "id": "pytest::tests/integration/test_legacy_migration.py::test_other",
+            },
+            *results[1:],
+        ],
+        [*results, results[0]],
+        [*results[1:], results[0]],
+        [{**results[0], "outcome": "skipped"}, *results[1:]],
+    )
+    for mutation in mutations:
+        with pytest.raises(verifier.EvidenceError):
+            verifier.validate_round4_results(mutation)
+
+
+def test_command_graph_contains_every_required_gate_and_forbids_service_mutation() -> (
+    None
+):
+    verifier = load_verifier()
+    graph = verifier.acceptance_command_graph(
+        Path("/home/d1sk/romm"),
+        source_container="romm-dev",
+        db_container="romm-db-dev",
+        image="romm-romm-dev",
+        network="romm_default",
+        node_image="node:24-bookworm",
+        contract_port=39006,
+    )
+    rendered = "\n".join(" ".join(command) for command in graph)
+    for filename in (
+        "rom.test.ts",
+        "upload.test.ts",
+        "screenshot.test.ts",
+        "ManualViewerControls.test.ts",
+        "ManualSubtab.test.ts",
+        "sourceMutationInventory.test.ts",
+        "sourceMutationControls.test.ts",
+    ):
+        assert filename in rendered
+    for required in (
+        "verify_storage_migrations.py",
+        "mariadb mysql postgresql",
+        "verify_phase6_contracts.py",
+        "node:24-bookworm",
+        "npm run test",
+        "npm run typecheck",
+        "npm run build",
+        "check_i18n_locales.py",
+        "check_i18n_sorted.py",
+        "git diff --check",
+    ):
+        assert required in rendered
+    for forbidden in (
+        "docker compose up",
+        "docker restart",
+        "--network host",
+        "--publish",
+        " 3000",
+    ):
+        assert forbidden not in rendered
+
+
+def test_source_manifest_schema_and_comparison_are_complete(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "game.bin").write_bytes(b"game")
+    (root / "folder").mkdir()
+    (root / "link").symlink_to("game.bin")
+
+    before = verifier.source_manifest(root)
+    assert {entry["kind"] for entry in before["entries"]} == {
+        "directory",
+        "file",
+        "symlink",
+    }
+    for entry in before["entries"]:
+        assert set(entry) == {
+            "path",
+            "kind",
+            "mode",
+            "size",
+            "sha256",
+            "symlink_target",
+        }
+    assert verifier.compare_source_manifests(before, verifier.source_manifest(root))
+    (root / "game.bin").write_bytes(b"changed")
+    assert not verifier.compare_source_manifests(before, verifier.source_manifest(root))
+
+
+def test_source_audit_parser_requires_exact_unique_covered_current_set() -> None:
+    verifier = load_verifier()
+    valid = source_audit_text(verifier)
+    assert verifier.parse_source_audit(valid) == verifier.REQUIRED_SOURCE_IDS
+    formatted = valid.replace(
+        "| --- | --- | --- | --- | --- |",
+        "| ------------ | ------- | ---------------- | ------------- | ------- |",
+    )
+    assert verifier.parse_source_audit(formatted) == verifier.REQUIRED_SOURCE_IDS
+    first_id = sorted(verifier.REQUIRED_SOURCE_IDS)[0]
+    cases = (
+        valid.replace(f"| CURRENT | {first_id} |", "", 1),
+        valid + f"\n| CURRENT | {first_id} | Duplicate | 47 | COVERED |",
+        valid + "\n| CURRENT | UNKNOWN-99 | Unknown | 47 | COVERED |",
+        valid.replace("| COVERED |", "| DEFERRED |", 1),
+        valid.replace("| COVERED |", "| PARTIAL |", 1),
+    )
+    for invalid in cases:
+        with pytest.raises(verifier.EvidenceError):
+            verifier.parse_source_audit(invalid)
+
+
+def test_validation_binding_rejects_stale_or_digest_mismatched_run() -> None:
+    verifier = load_verifier()
+    record = valid_record(verifier)
+    source_audit = source_audit_text(verifier)
+    validation = validation_text(record)
+    verifier.verify_evidence_record(record, validation, source_audit)
+
+    tampered = json.loads(json.dumps(record))
+    tampered["stages"]["prior_backend"]["outcomes"] = 938
+    with pytest.raises(verifier.EvidenceError, match="digest"):
+        verifier.verify_evidence_record(tampered, validation, source_audit)
+
+    stale = validation.replace(str(record["run_id"]), "d" * 32)
+    with pytest.raises(verifier.EvidenceError, match="run_id"):
+        verifier.verify_evidence_record(record, stale, source_audit)
+
+    stale_counts = validation.replace("Prior outcomes: 843", "Prior outcomes: 844")
+    with pytest.raises(verifier.EvidenceError, match="structured stage"):
+        verifier.verify_evidence_record(record, stale_counts, source_audit)
+
+
+def test_acceptance_record_rejects_missing_or_failed_structured_stages() -> None:
+    verifier = load_verifier()
+    record = valid_record(verifier)
+    verifier.validate_acceptance_record(record)
+
+    missing = json.loads(json.dumps(record))
+    del missing["stages"]["cleanup"]
+    missing["run_digest"] = verifier.canonical_run_digest(missing)
+    with pytest.raises(verifier.EvidenceError, match="cleanup"):
+        verifier.validate_acceptance_record(missing)
+
+    failed = json.loads(json.dumps(record))
+    failed["stages"]["frontend"]["build"]["exit_code"] = 1
+    failed["run_digest"] = verifier.canonical_run_digest(failed)
+    with pytest.raises(verifier.EvidenceError, match="build"):
+        verifier.validate_acceptance_record(failed)
+
+
+def test_redaction_is_bounded_and_removes_sensitive_values() -> None:
+    verifier = load_verifier()
+    secret = "private-password-value"
+    output = verifier.redact_output(
+        f"prefix {secret} /home/d1sk/romm/source/private.iso " + "x" * 10000,
+        secrets=(secret,),
+    )
+    assert secret not in output
+    assert "private.iso" not in output
+    assert len(output) <= verifier.MAX_STAGE_OUTPUT
+
+
+def test_parser_exposes_locked_modes() -> None:
+    verifier = load_verifier()
+    parser = verifier.build_parser()
+    assert parser.parse_args(["--self-test"]).self_test
+    assert parser.parse_args(["--audit-only"]).audit_only
+    assert parser.parse_args(
+        [
+            "--verify-evidence",
+            "--evidence-json",
+            "record.json",
+            "--validation",
+            "validation.md",
+            "--source-audit",
+            "audit.md",
+        ]
+    ).verify_evidence

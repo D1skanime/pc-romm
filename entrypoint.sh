@@ -1,0 +1,108 @@
+#!/bin/bash
+
+set -e
+
+echo "Starting entrypoint script..."
+
+# Create symlinks for frontend
+if [[ -L /app/frontend/assets/romm/resources ]]; then
+	target=$(readlink "/app/frontend/assets/romm/resources")
+
+	# If the target is not the same as ${ROMM_BASE_PATH}/resources, recreate the symbolic link.
+	if [[ ${target} != "${ROMM_BASE_PATH}/resources" ]]; then
+		rm "/app/frontend/assets/romm/resources"
+		ln -s "${ROMM_BASE_PATH}/resources" "/app/frontend/assets/romm/resources"
+	fi
+elif [[ ! -e /app/frontend/assets/romm/resources ]]; then
+	# Ensure parent directory exists before creating symbolic link
+	mkdir -p "/app/frontend/assets/romm"
+	ln -s "${ROMM_BASE_PATH}/resources" "/app/frontend/assets/romm/resources"
+fi
+
+# Define a signal handler to propagate termination signals
+function handle_termination() {
+	echo "Terminating child processes..."
+	# Kill all background jobs
+	# trunk-ignore(shellcheck)
+	kill -TERM $(jobs -p) 2>/dev/null
+}
+
+# Trap SIGTERM and SIGINT signals
+trap handle_termination SIGTERM SIGINT
+
+# Set ROMM_AUTH_SECRET_KEY if not already set
+if [[ -z ${ROMM_AUTH_SECRET_KEY-} ]]; then
+	ROMM_AUTH_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+	export ROMM_AUTH_SECRET_KEY
+fi
+
+# Start all services in the background
+echo "Starting backend..."
+cd /app/backend
+if [[ ${DEV_MODE:-false} == "true" ]]; then
+	echo "Starting backend under debugpy on :5678..."
+	# Add --wait-for-client after --listen to pause until VSCode attaches.
+	uv run python -m debugpy --listen 0.0.0.0:5678 main.py &
+else
+	uv run python main.py &
+fi
+
+echo "Starting RQ scheduler..."
+RQ_REDIS_HOST=${REDIS_HOST:-127.0.0.1} \
+	RQ_REDIS_PORT=${REDIS_PORT:-6379} \
+	RQ_REDIS_USERNAME=${REDIS_USERNAME:-""} \
+	RQ_REDIS_PASSWORD=${REDIS_PASSWORD:-""} \
+	RQ_REDIS_DB=${REDIS_DB:-0} \
+	RQ_REDIS_SSL=${REDIS_SSL:-0} \
+	rqscheduler \
+	--path /app/backend \
+	--pid /tmp/rq_scheduler.pid &
+
+echo "Starting RQ worker..."
+# Build Redis URL properly
+if [[ -n ${REDIS_PASSWORD-} ]]; then
+	REDIS_URL="redis${REDIS_SSL:+s}://${REDIS_USERNAME-}:${REDIS_PASSWORD}@${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}/${REDIS_DB:-0}"
+elif [[ -n ${REDIS_USERNAME-} ]]; then
+	REDIS_URL="redis${REDIS_SSL:+s}://${REDIS_USERNAME}@${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}/${REDIS_DB:-0}"
+else
+	REDIS_URL="redis${REDIS_SSL:+s}://${REDIS_HOST:-127.0.0.1}:${REDIS_PORT:-6379}/${REDIS_DB:-0}"
+fi
+
+# Set PYTHONPATH so RQ can find the tasks module.
+# The connection URL goes through RQ_REDIS_URL rather than --url, so the
+# embedded password stays out of the worker's world-readable command line.
+# Use a worker class that drops the noisy per-sweep "cleaning registries for
+# queue" log line. The maintenance interval keeps its default (~10 min) so
+# orphaned STARTED jobs and stale workers are still pruned promptly, which the
+# watcher's Worker.all() scan dedupe relies on.
+PYTHONPATH="/app/backend:${PYTHONPATH-}" \
+	RQ_REDIS_URL="${REDIS_URL}" \
+	rq worker \
+	--path /app/backend \
+	--worker-class handler.rq_worker.RomMWorker \
+	--pid /tmp/rq_worker.pid \
+	--logging_level "${LOGLEVEL:-INFO}" \
+	high default low &
+
+echo "Starting watcher..."
+watchfiles \
+	--target-type command \
+	'uv run python watcher.py' \
+	/app/romm/library &
+
+if [[ ${ENABLE_SYNC_FOLDER_WATCHER:-false} == "true" ]]; then
+	echo "Starting sync folder watcher..."
+	sync_base_path="${ROMM_BASE_PATH:-/romm}/sync"
+	mkdir -p "${sync_base_path}"
+	watchfiles \
+		--target-type command \
+		'uv run python sync_watcher.py' \
+		"${sync_base_path}" &
+fi
+
+# Start the frontend dev server
+cd /app/frontend
+npm run dev &
+
+# Wait for all background processes
+wait

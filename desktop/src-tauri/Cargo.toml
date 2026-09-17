@@ -1,0 +1,24 @@
+[package]
+name = "romm-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dependencies]
+romm-download-core = { path = "../crates/romm-download-core" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tauri = { version = "=2.11.5", features = [] }
+tauri-plugin-dialog = "=2.7.3"
+keyring = "=4.2.0"
+reqwest = { version = "=0.12.24", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls-tls",
+] }
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }

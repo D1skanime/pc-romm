@@ -1,0 +1,264 @@
+# Stages:
+#   - frontend-build: Build frontend
+#   - backend-build: Build backend environment
+#   - backend-dev-build: Similar to `backend-build`, but also compiles and installs development dependencies
+#   - rahasher-build: Build RAHasher
+#   - emulator-stage: Fetch and extract emulators
+#   - nginx-build: Build nginx modules
+#   - production-stage: Setup frontend and backend
+#   - slim-image: Slim image with only the necessary files
+#   - full-image: Full image with emulator stage
+#   - dev-slim: Slim image with development dependencies
+#   - dev-full: Full image with emulator stage and development dependencies
+
+
+# ARGUMENT DECLARATIONS
+ARG ALPINE_VERSION=3.23
+ARG ALPINE_SHA256=25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+ARG PYTHON_VERSION=3.13
+ARG PYTHON_ALPINE_SHA256=bb1f2fdb1065c85468775c9d680dcd344f6442a2d1181ef7916b60a623f11d40
+ARG NODE_VERSION=24.16
+ARG NODE_ALPINE_SHA256=2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14
+ARG NGINX_VERSION=1.29.5
+ARG NGINX_SHA256=1d13701a5f9f3fb01aaa88cef2344d65b6b5bf6b7d9fa4cf0dca557a8d7702ba
+ARG UV_VERSION=0.11.2
+ARG UV_SHA256=db7642df9c7e6214d4d7df81cfc3e8327768dd15565b1eb414bb83004f64d463
+
+
+FROM python:${PYTHON_VERSION}-alpine${ALPINE_VERSION}@sha256:${PYTHON_ALPINE_SHA256} AS python-alias
+
+
+# FRONTEND BUILD
+# Built on the native build platform: the output (/front/dist) is static JS/CSS,
+# fully architecture-independent, so there is no need to emulate the target arch.
+# This avoids running `npm ci`/Node under QEMU arm64 emulation, which hangs.
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-alpine${ALPINE_VERSION}@sha256:${NODE_ALPINE_SHA256} AS frontend-build
+WORKDIR /front
+
+COPY ./frontend/package*.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+COPY ./frontend ./
+RUN npm run build
+
+
+# BACKEND NODE HELPERS BUILD (server-side ROM patching via RomPatcher.js)
+FROM node:${NODE_VERSION}-alpine${ALPINE_VERSION}@sha256:${NODE_ALPINE_SHA256} AS backend-node-build
+WORKDIR /backend-node/rom_patcher
+COPY ./backend/utils/rom_patcher/package*.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+
+# https://github.com/astral-sh/uv/pkgs/container/uv/452595714
+FROM ghcr.io/astral-sh/uv:${UV_VERSION}-python${PYTHON_VERSION}-alpine@sha256:${UV_SHA256} AS uv-stage
+
+
+# BACKEND PYTHON BUILD
+FROM python-alias AS backend-build
+
+# git is needed to install streaming-form-data fork
+# libpq-dev is needed to build psycopg-c
+# mariadb-connector-c-dev is needed to build mariadb-connector
+RUN apk add --no-cache \
+    gcc \
+    git \
+    libpq-dev \
+    mariadb-connector-c-dev \
+    musl-dev
+
+COPY --from=uv-stage /usr/local/bin/uv /usr/local/bin/uvx /bin/
+
+WORKDIR /src
+
+COPY ./pyproject.toml ./uv.lock /src/
+RUN uv sync --frozen --no-cache
+
+FROM backend-build AS backend-dev-build
+
+# linux-headers is needed to install psutil
+RUN apk add --no-cache \
+    linux-headers
+
+RUN uv sync --frozen --no-cache --all-extras
+
+
+# CUSTOM RAHASHER FOR RETROACHIEVEMENTS
+FROM alpine:${ALPINE_VERSION}@sha256:${ALPINE_SHA256} AS rahasher-build
+RUN apk add --no-cache \
+    g++ \
+    git \
+    linux-headers \
+    make \
+    zlib-dev \
+    bash
+
+ARG RALIBRETRO_VERSION=1.8.3
+
+RUN git clone --recursive --branch "${RALIBRETRO_VERSION}" --depth 1 https://github.com/RetroAchievements/RALibretro.git && \
+    cd ./RALibretro && \
+    sed -i '22a #include <ctime>' ./src/Util.h && \
+    sed -i '6a #include <unistd.h>' \
+        ./src/libchdr/deps/zlib-1.3.1/gzlib.c \
+        ./src/libchdr/deps/zlib-1.3.1/gzread.c \
+        ./src/libchdr/deps/zlib-1.3.1/gzwrite.c && \
+    make HAVE_CHD=1 -f ./Makefile.RAHasher
+
+
+# FETCH EMULATORJS AND RUFFLE
+FROM alpine:${ALPINE_VERSION}@sha256:${ALPINE_SHA256} AS emulator-stage
+
+RUN apk add --no-cache \
+    7zip \
+    wget \
+    ca-certificates
+
+ARG EMULATORJS_VERSION=4.2.3
+ARG EMULATORJS_SHA256=07d451bc06fa3ad04ab30d9b94eb63ac34ad0babee52d60357b002bde8f3850b
+
+RUN wget "https://github.com/EmulatorJS/EmulatorJS/releases/download/v${EMULATORJS_VERSION}/${EMULATORJS_VERSION}.7z" && \
+    echo "${EMULATORJS_SHA256}  ${EMULATORJS_VERSION}.7z" | sha256sum -c - && \
+    7z x -y "${EMULATORJS_VERSION}.7z" -o/emulatorjs && \
+    rm -f "${EMULATORJS_VERSION}.7z"
+
+ARG RUFFLE_VERSION=nightly-2025-08-14
+ARG RUFFLE_FILE=ruffle-nightly-2025_08_14-web-selfhosted.zip
+ARG RUFFLE_SHA256=178870c5e7dd825a8df35920dfc5328d83e53f3c4d5d95f70b1ea9cd13494151
+
+RUN wget "https://github.com/ruffle-rs/ruffle/releases/download/${RUFFLE_VERSION}/${RUFFLE_FILE}" && \
+    echo "${RUFFLE_SHA256}  ${RUFFLE_FILE}" | sha256sum -c - && \
+    unzip -o "${RUFFLE_FILE}" -d /ruffle && \
+    rm -f "${RUFFLE_FILE}"
+
+
+# BUILD NGINX MODULE WITH MOD_ZIP
+FROM alpine:${ALPINE_VERSION}@sha256:${ALPINE_SHA256} AS nginx-build
+
+RUN apk add --no-cache \
+    gcc \
+    git \
+    libc-dev \
+    make \
+    pcre-dev \
+    zlib-dev
+
+ARG NGINX_VERSION
+# The specified commit SHA is the latest commit on the `master` branch at the time of writing.
+# It includes a fix to correctly calculate CRC-32 checksums when using upstream subrequests.
+# TODO: Move to a tagged release of `mod_zip`, once a version newer than 1.3.0 is released.
+ARG NGINX_MOD_ZIP_COMMIT=a9f9afa441117831cc712a832c98408b3f0416f6
+
+# Clone both `nginx` and `ngx_http_zip_module` repositories, needed to compile the module from source.
+# This is needed to be able to dinamically load it as a module in the final image. `nginx` Docker
+# images do not have a simple way to include third-party modules.
+RUN git clone https://github.com/evanmiller/mod_zip.git && \
+    cd ./mod_zip && \
+    git checkout "${NGINX_MOD_ZIP_COMMIT}" && \
+    cd ../ && \
+    git clone --branch "release-${NGINX_VERSION}" --depth 1 https://github.com/nginx/nginx.git && \
+    cd ./nginx && \
+    ./auto/configure --with-compat --add-dynamic-module=../mod_zip/ && \
+    make -f ./objs/Makefile modules && \
+    chmod 644 ./objs/ngx_http_zip_module.so
+
+
+# PRODUCTION STAGE
+FROM nginx:${NGINX_VERSION}-alpine${ALPINE_VERSION}@sha256:${NGINX_SHA256} AS production-stage
+ARG WEBSERVER_FOLDER=/var/www/html
+
+RUN apk add --no-cache \
+    bash \
+    libarchive-tools \
+    libmagic \
+    mariadb-connector-c \
+    libpq \
+    nodejs \
+    7zip \
+    tzdata \
+    valkey
+
+# Add Python by copying it from the official Docker image. This way, we don't rely on Alpine's
+# Python version, which could not be the same as the one used in the backend build stage.
+# TODO: Replace with a bundled installation of Python using `uv`, when it is supported.
+#       Related issue: https://github.com/astral-sh/uv/issues/7865
+ARG PYTHON_VERSION
+COPY --from=python-alias /usr/lib/* /usr/lib/
+COPY --from=python-alias /usr/local/bin/* /usr/local/bin/
+COPY --from=python-alias /usr/local/include/python${PYTHON_VERSION} /usr/local/include/python${PYTHON_VERSION}
+COPY --from=python-alias /usr/local/lib/libpython* /usr/local/lib/
+COPY --from=python-alias /usr/local/lib/python${PYTHON_VERSION} /usr/local/lib/python${PYTHON_VERSION}
+
+COPY --from=rahasher-build /RALibretro/bin64/RAHasher /usr/bin/RAHasher
+COPY --from=nginx-build ./nginx/objs/ngx_http_zip_module.so /usr/lib/nginx/modules/
+COPY --from=frontend-build /front/dist ${WEBSERVER_FOLDER}
+COPY --from=backend-node-build /backend-node/rom_patcher/node_modules/rom-patcher/rom-patcher-js /backend/utils/rom_patcher/rom-patcher-js
+
+COPY ./frontend/assets ${WEBSERVER_FOLDER}/assets
+RUN mkdir -p ${WEBSERVER_FOLDER}/assets/romm && \
+    ln -sf /romm/resources ${WEBSERVER_FOLDER}/assets/romm/resources
+COPY ./backend /backend
+
+# Setup init script and config files
+COPY ./docker/init_scripts/* /
+COPY ./docker/nginx/js/ /etc/nginx/js/
+COPY ./docker/nginx/templates/ /etc/nginx/templates/
+COPY ./docker/nginx/default.conf /etc/nginx/nginx.conf
+COPY ./docker/gunicorn/logging.conf /etc/gunicorn/logging.conf
+
+# User permissions
+# - Create default user `romm` (1000) and group `romm` (1000).
+# - Create base directories and make default user/group the owner.
+# - Make nginx configuration files writable by everyone for `envsubst` to work
+RUN addgroup -g 1000 -S romm && adduser -u 1000 -D -S -G romm romm && \
+    mkdir /romm /redis-data && \
+    chown romm:romm /romm /redis-data && \
+    chmod 755 /romm /redis-data && \
+    chmod -R a+w /etc/nginx/conf.d && \
+    chmod -R a+w /etc/gunicorn
+
+
+# SLIM IMAGE
+FROM scratch AS slim-image
+
+COPY --from=production-stage / /
+
+COPY --from=backend-build /src/.venv /src/.venv
+
+ENV PATH="/src/.venv/bin:${PATH}"
+
+# ScreenScraper developer (application) credentials, injected at build time from
+# CI secrets. Kept out of the source tree; empty when not supplied at build.
+ARG SCREENSCRAPER_DEV_ID
+ARG SCREENSCRAPER_DEV_PASSWORD
+ENV SCREENSCRAPER_DEV_ID=${SCREENSCRAPER_DEV_ID}
+ENV SCREENSCRAPER_DEV_PASSWORD=${SCREENSCRAPER_DEV_PASSWORD}
+
+# Security: Set security-focused environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/backend
+
+# Declare only the parent `/romm`, not its subdirs, so Docker keeps them 
+# on one mount (`st_dev`) and cross-directory `os.link()` hardlinks don't fail.
+VOLUME ["/romm", "/redis-data"]
+
+# Expose non-privileged ports
+EXPOSE 8080 6379/tcp
+WORKDIR /romm
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["/init"]
+
+
+# FULL IMAGE
+FROM slim-image AS full-image
+ARG WEBSERVER_FOLDER=/var/www/html
+COPY --from=emulator-stage /emulatorjs ${WEBSERVER_FOLDER}/assets/emulatorjs
+COPY --from=emulator-stage /ruffle ${WEBSERVER_FOLDER}/assets/ruffle
+
+
+FROM slim-image AS dev-slim
+COPY --from=backend-dev-build /src/.venv /src/.venv
+
+
+FROM full-image AS dev-full
+COPY --from=backend-dev-build /src/.venv /src/.venv

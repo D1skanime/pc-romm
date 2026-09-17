@@ -1,0 +1,570 @@
+import gzip
+import os
+import secrets
+from typing import Annotated, BinaryIO, cast
+
+from fastapi import Header, HTTPException
+from fastapi import Path as PathVar
+from fastapi import Request, status
+from fastapi.responses import Response
+from starlette.requests import ClientDisconnect
+from streaming_form_data import StreamingFormDataParser
+from streaming_form_data.targets import BaseTarget, FileTarget, NullTarget
+
+from adapters.services.screenscraper import media_download_slot
+from decorators.auth import protected_route
+from endpoints.storage_policy import authorize_api_storage_operation
+from exceptions.endpoint_exceptions import RomNotFoundInDatabaseException
+from exceptions.fs_exceptions import RomAlreadyExistsException
+from exceptions.storage_exceptions import MissingStorageTargetError
+from handler.auth.constants import Scope
+from handler.auth.dependencies import assert_rom_visible
+from handler.database import db_primary_manual_handler, db_rom_handler
+from handler.filesystem import (
+    fs_resource_handler,
+    fs_rom_handler,
+    legacy_external_storage,
+    storage_composition,
+)
+from handler.filesystem.resources_handler import (
+    ALLOWED_MANUAL_EXTENSIONS,
+    LOCAL_FILE_SCHEMES,
+    _check_content_type,
+    _resolve_local_file_uri,
+)
+from handler.filesystem.storage_access import (
+    OwnedCreate,
+    OwnedDelete,
+    open_owned_access,
+)
+from handler.filesystem.storage_policy import (
+    OwnedStorageKind,
+    StorageOperation,
+)
+from handler.rom_conversion import promote_single_file_to_folder
+from logger.formatter import BLUE
+from logger.formatter import highlight as hl
+from logger.logger import log
+from models.rom import RomFile, RomFileCategory
+from utils.context import ctx_httpx_client
+from utils.router import APIRouter
+
+router = APIRouter()
+
+MANUAL_FOLDER = "manual"
+
+
+def _is_allowed_manual_file(file_name: str) -> bool:
+    _, ext = os.path.splitext(file_name)
+    return ext.lower() in ALLOWED_MANUAL_EXTENSIONS
+
+
+class _BinaryFileTarget(BaseTarget):
+    def __init__(self, file: BinaryIO) -> None:
+        super().__init__()
+        self._file = file
+
+    def on_data_received(self, chunk: bytes) -> None:
+        self._file.write(chunk)
+
+
+def _delete_owned_manual(path: str) -> None:
+    with open_owned_access(
+        storage_composition.owned[OwnedStorageKind.RESOURCES],
+        StorageOperation.DELETE,
+        path,
+    ) as capability:
+        cast(OwnedDelete, capability).delete()
+
+
+def _commit_primary_manual(rom, *, expected_path: str, new_path: str) -> bool:
+    """CAS-publish one staged candidate and clean the losing generation."""
+    if not db_primary_manual_handler.compare_and_swap_path(
+        rom.id, expected_path=expected_path, new_path=new_path
+    ):
+        _delete_owned_manual(new_path)
+        return False
+
+    validated_old_path = fs_resource_handler._validated_manual_path(rom)
+    if validated_old_path == expected_path and expected_path != new_path:
+        try:
+            _delete_owned_manual(expected_path)
+        except MissingStorageTargetError:
+            pass
+        except Exception:
+            log.warning("Superseded primary manual cleanup failed")
+    return True
+
+
+async def _write_redownload_candidate(file: BinaryIO, url_manual: str) -> None:
+    """Copy one local or HTTP manual into an uncommitted owned candidate."""
+    if url_manual.startswith(LOCAL_FILE_SCHEMES):
+        source_path = _resolve_local_file_uri(url_manual)
+        if source_path is None or not source_path.is_file():
+            raise ValueError("Manual source is unavailable")
+        with source_path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                file.write(chunk)
+        return
+
+    httpx_client = ctx_httpx_client.get()
+    async with media_download_slot(url_manual) as timeout:
+        async with httpx_client.stream("GET", url_manual, timeout=timeout) as response:
+            if response.status_code != status.HTTP_200_OK:
+                raise ValueError("Manual source returned an unsuccessful status")
+            if not _check_content_type(
+                response,
+                (
+                    "application/pdf",
+                    "application/force-download",
+                    "application/octet-stream",
+                ),
+                "manual",
+            ):
+                raise ValueError("Manual source returned an unsupported content type")
+
+            if response.headers.get("content-encoding", "").lower() == "gzip":
+                content = await response.aread()
+                try:
+                    file.write(gzip.decompress(content))
+                except gzip.BadGzipFile:
+                    file.write(content)
+            else:
+                async for chunk in response.aiter_raw():
+                    file.write(chunk)
+
+
+def _manual_candidate_path(rom, extension: str = ".pdf") -> str:
+    return (
+        f"{rom.fs_resources_path}/{MANUAL_FOLDER}/"
+        f"{secrets.token_hex(16)}{extension}"
+    )
+
+
+@protected_route(
+    router.post,
+    "/{id}/manuals",
+    [Scope.ROMS_WRITE],
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_404_NOT_FOUND: {},
+        status.HTTP_409_CONFLICT: {},
+    },
+)
+async def add_rom_manuals(
+    request: Request,
+    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
+    filename: Annotated[
+        str,
+        Header(
+            description="The name of the file being uploaded.",
+            alias="x-upload-filename",
+        ),
+    ],
+) -> Response:
+    """Replace the primary manual with a complete owned file."""
+
+    rom = db_rom_handler.get_rom(id)
+    if not rom:
+        raise RomNotFoundInDatabaseException(id)
+    assert_rom_visible(request, rom)
+
+    if not _is_allowed_manual_file(filename):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported manual file type. Allowed: "
+                f"{', '.join(sorted(ALLOWED_MANUAL_EXTENSIONS))}"
+            ),
+        )
+    try:
+        safe_field_name = fs_resource_handler._sanitize_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid upload filename: {exc}",
+        ) from exc
+
+    expected_path = rom.path_manual or ""
+    extension = os.path.splitext(filename)[1].lower()
+    manuals_path = f"{rom.fs_resources_path}/{MANUAL_FOLDER}"
+    new_path = _manual_candidate_path(rom, extension)
+    authorize_api_storage_operation(
+        StorageOperation.CREATE,
+        storage_composition.owned[OwnedStorageKind.RESOURCES],
+    )
+    await fs_resource_handler.make_directory(manuals_path)
+
+    published = False
+    try:
+        with open_owned_access(
+            storage_composition.owned[OwnedStorageKind.RESOURCES],
+            StorageOperation.CREATE,
+            new_path,
+        ) as capability:
+            with cast(OwnedCreate, capability).binary_file() as file:
+                parser = StreamingFormDataParser(headers=request.headers)
+                parser.register("x-upload-platform", NullTarget())
+                parser.register(safe_field_name, _BinaryFileTarget(file))
+                async for chunk in request.stream():
+                    parser.data_received(chunk)
+        published = True
+
+        if not _commit_primary_manual(
+            rom, expected_path=expected_path, new_path=new_path
+        ):
+            published = False
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The primary manual changed during upload. Please retry.",
+            )
+        published = False
+    except ClientDisconnect:
+        log.error("Client disconnected during manual upload")
+        if published:
+            _delete_owned_manual(new_path)
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("Primary manual upload failed", exc_info=exc)
+        if published:
+            try:
+                _delete_owned_manual(new_path)
+            except Exception:
+                log.error("Primary manual cleanup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="There was an error uploading the manual",
+        ) from exc
+
+    return Response(status_code=status.HTTP_201_CREATED)
+
+
+@protected_route(
+    router.post,
+    "/{id}/manuals/redownload",
+    [Scope.ROMS_WRITE],
+    responses={
+        status.HTTP_404_NOT_FOUND: {},
+        status.HTTP_400_BAD_REQUEST: {},
+    },
+)
+async def redownload_rom_manual(
+    request: Request,
+    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
+) -> Response:
+    """Re-download a rom's manual from its scraped URL (e.g. screenscraper.fr)."""
+
+    rom = db_rom_handler.get_rom(id)
+    if not rom:
+        raise RomNotFoundInDatabaseException(id)
+
+    assert_rom_visible(request, rom)
+
+    if not rom.url_manual:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No scraped manual URL available for this ROM",
+        )
+
+    expected_path = rom.path_manual or ""
+    manuals_path = f"{rom.fs_resources_path}/{MANUAL_FOLDER}"
+    new_path = _manual_candidate_path(rom)
+    authorize_api_storage_operation(
+        StorageOperation.CREATE,
+        storage_composition.owned[OwnedStorageKind.RESOURCES],
+    )
+    await fs_resource_handler.make_directory(manuals_path)
+
+    published = False
+    try:
+        with open_owned_access(
+            storage_composition.owned[OwnedStorageKind.RESOURCES],
+            StorageOperation.CREATE,
+            new_path,
+        ) as capability:
+            with cast(OwnedCreate, capability).binary_file() as file:
+                await _write_redownload_candidate(file, str(rom.url_manual))
+        published = True
+
+        if not _commit_primary_manual(
+            rom, expected_path=expected_path, new_path=new_path
+        ):
+            published = False
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The primary manual changed during redownload. Please retry.",
+            )
+        published = False
+        log.info(
+            f"Re-downloaded manual for {hl(rom.name or 'ROM', color=BLUE)} "
+            f"[{hl(rom.fs_name)}]"
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("Error re-downloading manual", exc_info=exc)
+        if published:
+            try:
+                _delete_owned_manual(new_path)
+            except Exception:
+                log.error("Primary manual cleanup failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="There was an error re-downloading the manual",
+        ) from exc
+
+    return Response()
+
+
+@protected_route(
+    router.post,
+    "/{id}/manuals/files",
+    [Scope.ROMS_WRITE],
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_404_NOT_FOUND: {},
+        status.HTTP_400_BAD_REQUEST: {},
+    },
+)
+async def add_rom_manual_file(
+    request: Request,
+    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
+    filename: Annotated[
+        str,
+        Header(
+            description="The name of the file being uploaded.",
+            alias="x-upload-filename",
+        ),
+    ],
+) -> Response:
+    """Upload a manual PDF into the ROM's own manual/ subfolder."""
+
+    rom = db_rom_handler.get_rom(id)
+    if not rom:
+        raise RomNotFoundInDatabaseException(id)
+
+    assert_rom_visible(request, rom)
+    authorize_api_storage_operation(
+        StorageOperation.SIDECAR_WRITE, legacy_external_storage
+    )
+
+    if rom.has_simple_single_file:
+        try:
+            rom = await promote_single_file_to_folder(rom)
+        except RomAlreadyExistsException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+            ) from exc
+
+    try:
+        safe_filename = fs_rom_handler._sanitize_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid upload filename: {exc}",
+        ) from exc
+
+    if safe_filename != filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upload filename must be a plain file name, not a path",
+        )
+
+    if not _is_allowed_manual_file(safe_filename):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported manual file type. Allowed: "
+                f"{', '.join(sorted(ALLOWED_MANUAL_EXTENSIONS))}"
+            ),
+        )
+
+    manual_dir_rel = f"{rom.full_path}/{MANUAL_FOLDER}"
+    file_rel_path = f"{manual_dir_rel}/{safe_filename}"
+    file_location = fs_rom_handler.validate_path(file_rel_path)
+    log.info(f"Uploading manual file to {hl(str(file_location))}")
+
+    await fs_rom_handler.make_directory(manual_dir_rel)
+
+    parser = StreamingFormDataParser(headers=request.headers)
+    parser.register("x-upload-platform", NullTarget())
+    parser.register(safe_filename, FileTarget(str(file_location)))
+
+    def cleanup_partial_file():
+        if file_location.exists():
+            file_location.unlink()
+
+    try:
+        async for chunk in request.stream():
+            parser.data_received(chunk)
+    except ClientDisconnect:
+        log.error("Client disconnected during upload")
+        cleanup_partial_file()
+        raise
+    except Exception as exc:
+        log.error("Error uploading manual file", exc_info=exc)
+        cleanup_partial_file()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="There was an error uploading the manual file",
+        ) from exc
+
+    stat = os.stat(file_location)
+    existing = db_rom_handler.get_rom_file_by_path(
+        rom_id=rom.id, file_path=manual_dir_rel, file_name=safe_filename
+    )
+    if existing:
+        db_rom_handler.update_rom_file(
+            existing.id,
+            {
+                "file_size_bytes": stat.st_size,
+                "last_modified": stat.st_mtime,
+                "category": RomFileCategory.MANUAL,
+                "missing_from_fs": False,
+            },
+        )
+    else:
+        db_rom_handler.add_rom_file(
+            RomFile(
+                rom_id=rom.id,
+                file_name=safe_filename,
+                file_path=manual_dir_rel,
+                file_size_bytes=stat.st_size,
+                last_modified=stat.st_mtime,
+                category=RomFileCategory.MANUAL,
+            )
+        )
+
+    return Response(status_code=status.HTTP_201_CREATED)
+
+
+@protected_route(
+    router.delete,
+    "/{id}/manuals/files/{file_id}",
+    [Scope.ROMS_WRITE],
+    responses={status.HTTP_404_NOT_FOUND: {}},
+)
+async def delete_rom_manual_file(
+    request: Request,
+    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
+    file_id: Annotated[int, PathVar(description="Rom file internal id.", ge=1)],
+) -> Response:
+    """Delete a single manual file from a ROM's manual/ subfolder."""
+
+    rom = db_rom_handler.get_rom(id)
+    if not rom:
+        raise RomNotFoundInDatabaseException(id)
+
+    assert_rom_visible(request, rom)
+    authorize_api_storage_operation(StorageOperation.DELETE, legacy_external_storage)
+
+    rom_file = db_rom_handler.get_rom_file_by_id(file_id)
+    if (
+        not rom_file
+        or rom_file.rom_id != rom.id
+        or rom_file.category != RomFileCategory.MANUAL
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual file not found",
+        )
+
+    file_rel_path = rom_file.full_path
+
+    try:
+        await fs_rom_handler.remove_file(file_rel_path)
+    except FileNotFoundError:
+        log.warning(
+            f"Manual file {hl(file_rel_path)} not found on disk; "
+            f"removing DB row anyway"
+        )
+    except Exception as exc:
+        log.error(f"Error deleting manual file {hl(file_rel_path)}", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="There was an error deleting the manual file",
+        ) from exc
+
+    db_rom_handler.delete_rom_file(file_id)
+
+    log.info(
+        f"Deleted manual file {hl(rom_file.file_name)} from "
+        f"{hl(rom.name or 'ROM', color=BLUE)} [{hl(rom.fs_name)}]"
+    )
+
+    return Response()
+
+
+@protected_route(
+    router.delete,
+    "/{id}/manuals",
+    [Scope.ROMS_WRITE],
+    responses={
+        status.HTTP_404_NOT_FOUND: {},
+        status.HTTP_409_CONFLICT: {},
+    },
+)
+async def delete_rom_manuals(
+    request: Request,
+    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
+) -> Response:
+    """Delete manuals for a rom."""
+
+    rom = db_rom_handler.get_rom(id)
+    if not rom:
+        raise RomNotFoundInDatabaseException(id)
+
+    assert_rom_visible(request, rom)
+
+    expected_path = rom.path_manual if isinstance(rom.path_manual, str) else ""
+    if expected_path:
+        target_path = fs_resource_handler._validated_manual_path(rom)
+    else:
+        target_path = fs_resource_handler._get_manual_path(rom)
+    if target_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No manual found for this ROM",
+        )
+
+    authorize_api_storage_operation(
+        StorageOperation.DELETE,
+        storage_composition.owned[OwnedStorageKind.RESOURCES],
+    )
+
+    try:
+        _delete_owned_manual(target_path)
+    except MissingStorageTargetError:
+        log.warning("Authoritative primary manual was already absent")
+    except Exception as exc:
+        log.error("Error deleting primary manual", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="There was an error deleting the manual",
+        ) from exc
+
+    try:
+        if not db_primary_manual_handler.clear_if_path_matches(
+            id, expected_path=expected_path
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The primary manual changed during deletion. Please retry.",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("Error clearing primary manual metadata", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="There was an error deleting the manual",
+        ) from exc
+
+    log.info(
+        f"Deleted manual for {hl(rom.name or 'ROM', color=BLUE)} "
+        f"[{hl(rom.fs_name)}]"
+    )
+
+    return Response()

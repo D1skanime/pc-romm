@@ -1,0 +1,31 @@
+/* generated using openapi-typescript-codegen -- do not edit */
+/* istanbul ignore file */
+/* tslint:disable */
+/* eslint-disable */
+import type { DeviceSyncSchema } from './DeviceSyncSchema';
+import type { ScreenshotSchema } from './ScreenshotSchema';
+export type SaveSchema = {
+    id: number;
+    user_id: number;
+    file_name: string;
+    file_name_no_tags: string;
+    file_name_no_ext: string;
+    file_extension: string;
+    file_path: string;
+    file_size_bytes: number;
+    full_path: string;
+    download_path: string;
+    missing_from_fs: boolean;
+    created_at: string;
+    updated_at: string;
+    rom_id: (number | null);
+    retained_catalog_id?: (number | null);
+    emulator: (string | null);
+    slot?: (string | null);
+    content_hash?: (string | null);
+    is_public?: boolean;
+    screenshot: (ScreenshotSchema | null);
+    origin_device_id?: (string | null);
+    device_syncs?: Array<DeviceSyncSchema>;
+};
+
