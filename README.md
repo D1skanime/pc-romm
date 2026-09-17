@@ -18,6 +18,10 @@
   </div>
 </div>
 
+> **Independent fork notice**
+>
+> This repository is an independent fork maintained by [D1skanime](https://github.com/D1skanime). It is not an official RomM product and is not endorsed or supported by the RomM project. The upstream project is available at [rommapp/romm](https://github.com/rommapp/romm).
+
 # Overview
 
 RomM (ROM Manager) allows you to scan, enrich, browse and play your game collection with a clean and responsive interface. With support for multiple platforms, various naming schemes, and custom tags, RomM is a must-have for anyone who plays on emulators.
@@ -44,6 +48,10 @@ RomM (ROM Manager) allows you to scan, enrich, browse and play your game collect
 ## Installation
 
 To start using RomM, check out the [Quick Start Guide][docs-quick-start-guide] in the docs. If you are having issues with RomM, please review the page for [troubleshooting steps][docs-troubleshooting].
+
+### Fork-specific changes
+
+This fork includes experimental PC-library component and immutable download-manifest work, direct large-file transfer support, and related safety hardening. Fork-specific behavior may differ from the upstream documentation and should be evaluated before production use.
 
 ## Contributing
 
