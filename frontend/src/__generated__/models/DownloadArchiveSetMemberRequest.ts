@@ -2,7 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-export type RomOwnedBackgroundAudioRequest = {
-    media_ids: Array<number>;
-    expected_version: string;
+export type DownloadArchiveSetMemberRequest = {
+    component_id: number;
+    manifest_member_id: number;
+    required?: boolean;
 };
